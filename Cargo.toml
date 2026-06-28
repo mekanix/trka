@@ -1,0 +1,25 @@
+[package]
+name = "trka"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+bevy = { version = "0.19", default-features = false, features = [
+    "bevy_asset",
+    "bevy_core_pipeline",
+    "bevy_pbr",
+    "bevy_render",
+    "bevy_scene",
+    "bevy_window",
+    "bevy_winit",
+    "default_font",
+    "png",
+    "tonemapping_luts",
+    "x11",
+    "zstd_rust",
+] }
+avian3d = "0.7"
+maolan-engine = "0.2"
+tokio = { version = "1", features = ["full"] }
+tracing = "0.1"
+tracing-subscriber = "0.3"

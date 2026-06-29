@@ -1,0 +1,51 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<osm version="0.6">
+  <node id="1" lat="40.7500" lon="-73.9840" />
+  <node id="2" lat="40.7500" lon="-73.9800" />
+  <node id="3" lat="40.7520" lon="-73.9800" />
+  <node id="4" lat="40.7520" lon="-73.9840" />
+  <node id="5" lat="40.7510" lon="-73.9820" />
+
+  <way id="10">
+    <nd ref="1" />
+    <nd ref="2" />
+    <tag k="highway" v="residential" />
+  </way>
+  <way id="11">
+    <nd ref="2" />
+    <nd ref="3" />
+    <tag k="highway" v="residential" />
+  </way>
+  <way id="12">
+    <nd ref="3" />
+    <nd ref="4" />
+    <tag k="highway" v="residential" />
+  </way>
+  <way id="13">
+    <nd ref="4" />
+    <nd ref="1" />
+    <tag k="highway" v="residential" />
+  </way>
+  <way id="14">
+    <nd ref="1" />
+    <nd ref="5" />
+    <nd ref="3" />
+    <tag k="highway" v="residential" />
+  </way>
+  <way id="20">
+    <nd ref="1" />
+    <nd ref="2" />
+    <nd ref="5" />
+    <nd ref="1" />
+    <tag k="building" v="yes" />
+    <tag k="building:levels" v="3" />
+  </way>
+  <way id="21">
+    <nd ref="5" />
+    <nd ref="3" />
+    <nd ref="4" />
+    <nd ref="5" />
+    <tag k="building" v="yes" />
+    <tag k="height" v="12" />
+  </way>
+</osm>

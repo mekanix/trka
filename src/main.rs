@@ -1,5 +1,9 @@
 use avian3d::prelude::*;
+use bevy::asset::RenderAssetUsages;
+use bevy::input::mouse::{MouseScrollUnit, MouseWheel};
 use bevy::prelude::*;
+use bevy::tasks::{block_on, AsyncComputeTaskPool};
+use bevy::tasks::futures_lite::future::poll_once;
 use bevy::window::{PresentMode, Window, WindowPlugin};
 use maolan_engine::{
     client::Client,
@@ -20,9 +24,30 @@ use tracing_subscriber::{
     prelude::*,
 };
 
+mod osm;
+mod track;
+mod world;
+
+use osm::{Building, OsmData, RoadSegment};
+use track::{build_building_mesh, build_fences, build_track_mesh, save_track, Track};
+use world::{fetch_natural_earth_land, fetch_urban_areas, ContinentPolygon};
+
 const AUDIO_SAMPLE_RATE: i32 = 48_000;
 const AUDIO_DEVICE: &str = "/dev/dsp5";
 const ENGINE_HUM_WAV: &str = "engine_hum.wav";
+const TRACK_FILE: &str = "track.json";
+const DEFAULT_BBOX: &str = "40.748,-73.985,40.753,-73.978";
+const OSM_SCALE: f32 = 0.3;
+const WORLD_SIZE: f32 = 2000.0;
+
+#[derive(Clone, Copy, Default, Eq, PartialEq, Debug, Hash, States)]
+enum AppState {
+    #[default]
+    WorldMap,
+    Loading,
+    MapSelect,
+    Drive,
+}
 
 fn main() {
     init_logging();
@@ -52,11 +77,42 @@ fn main() {
                 }),
         )
         .add_plugins(PhysicsPlugins::default())
+        .init_state::<AppState>()
         .insert_resource(EngineSpeed(speed))
+        .insert_resource(Route(Vec::new()))
+        .insert_resource(SelectedRegion::default())
+        .insert_resource(WorldContinents::default())
+        .insert_resource(WorldUrbanAreas::default())
+        .insert_resource(WorldMapDragState::default())
         .add_systems(Startup, setup)
+        .add_systems(OnEnter(AppState::WorldMap), enter_world_map)
+        .add_systems(OnExit(AppState::WorldMap), exit_world_map)
         .add_systems(
             Update,
-            (vehicle_controls, camera_follow, update_engine_speed),
+            (
+                world_map_zoom,
+                world_map_drag,
+                check_world_map_fetch,
+                check_urban_fetch,
+                draw_map_outlines,
+            )
+                .run_if(in_state(AppState::WorldMap)),
+        )
+        .add_systems(OnEnter(AppState::Loading), (enter_loading, start_osm_fetch))
+        .add_systems(Update, check_osm_fetch.run_if(in_state(AppState::Loading)))
+        .add_systems(OnEnter(AppState::MapSelect), enter_map_select)
+        .add_systems(OnExit(AppState::MapSelect), exit_map_select)
+        .add_systems(
+            Update,
+            (map_select_input, map_select_zoom, update_camera_overview)
+                .run_if(in_state(AppState::MapSelect)),
+        )
+        .add_systems(OnEnter(AppState::Drive), enter_drive)
+        .add_systems(OnExit(AppState::Drive), exit_drive)
+        .add_systems(
+            Update,
+            (vehicle_controls, camera_follow, update_engine_speed, drive_input)
+                .run_if(in_state(AppState::Drive)),
         )
         .run();
 }
@@ -88,8 +144,106 @@ fn parse_log_level() -> Option<tracing::Level> {
     }
 }
 
+fn parse_bbox(region: &SelectedRegion) -> String {
+    let args: Vec<String> = std::env::args().collect();
+    if let Some(pos) = args.iter().position(|a| a == "--bbox") {
+        if pos + 1 < args.len() {
+            return normalize_bbox(&args[pos + 1]).unwrap_or_else(|| args[pos + 1].clone());
+        }
+    }
+    if let Some(bbox) = &region.bbox {
+        return bbox.clone();
+    }
+    DEFAULT_BBOX.to_string()
+}
+
+fn parse_osm_file() -> Option<String> {
+    let args: Vec<String> = std::env::args().collect();
+    if let Some(pos) = args.iter().position(|a| a == "--osm-file") {
+        if pos + 1 < args.len() {
+            return Some(args[pos + 1].clone());
+        }
+    }
+    None
+}
+
+/// Accept Overpass format `south,west,north,east` (lat,lon,lat,lon) or
+/// common OSM URL format `west,south,east,north` (lon,lat,lon,lat).
+fn normalize_bbox(input: &str) -> Option<String> {
+    let parts: Vec<&str> = input.split(',').collect();
+    if parts.len() != 4 {
+        return None;
+    }
+    let values: Vec<f64> = parts.iter().filter_map(|p| p.parse().ok()).collect();
+    if values.len() != 4 {
+        return None;
+    }
+
+    // If the first value is a longitude (outside [-90, 90]), swap to lat,lon order.
+    if values[0].abs() > 90.0 {
+        Some(format!(
+            "{},{},{},{}",
+            values[1], values[0], values[3], values[2]
+        ))
+    } else {
+        Some(input.to_string())
+    }
+}
+
 #[derive(Resource)]
 struct EngineSpeed(Arc<AtomicU32>);
+
+#[derive(Resource)]
+struct Route(Vec<Vec3>);
+
+#[derive(Resource)]
+struct OsmRoads(Vec<RoadSegment>);
+
+#[derive(Resource)]
+struct OsmBuildings(Vec<Building>);
+
+#[derive(Resource, Default)]
+struct SelectedRegion {
+    bbox: Option<String>,
+}
+
+#[derive(Resource, Default)]
+struct WorldContinents(Vec<ContinentPolygon>);
+
+#[derive(Resource, Default)]
+struct WorldUrbanAreas(Vec<ContinentPolygon>);
+
+#[derive(Resource, Default)]
+struct WorldMapDragState {
+    last_cursor: Option<Vec2>,
+}
+
+#[derive(Component)]
+struct LoadingText;
+
+#[derive(Component)]
+struct WorldMapText;
+
+#[derive(Component)]
+struct ContinentVisual;
+
+#[derive(Component)]
+struct RoadSegmentVisual;
+
+#[derive(Component)]
+struct BuildingVisual;
+
+#[derive(Component)]
+struct RouteMarker;
+
+#[derive(Component)]
+struct RouteLine;
+
+#[derive(Component)]
+struct TrackRoad;
+
+#[derive(Component)]
+struct TrackFence;
 
 #[derive(Component)]
 struct Vehicle;
@@ -108,6 +262,15 @@ impl Default for VehicleController {
         }
     }
 }
+
+#[derive(Component)]
+struct OsmFetchTask(bevy::tasks::Task<Result<OsmData, String>>);
+
+#[derive(Component)]
+struct WorldMapFetchTask(bevy::tasks::Task<Result<Vec<ContinentPolygon>, String>>);
+
+#[derive(Component)]
+struct UrbanFetchTask(bevy::tasks::Task<Result<Vec<ContinentPolygon>, String>>);
 
 const THROTTLE_RATE: f32 = 8.0;
 const BRAKE_RATE: f32 = 12.0;
@@ -128,7 +291,11 @@ fn setup(
 ) {
     commands.spawn((
         Camera3d::default(),
-        Transform::from_xyz(0.0, 12.0, 25.0).looking_at(Vec3::new(20.0, 0.0, 0.0), Vec3::Y),
+        Projection::from(PerspectiveProjection {
+            far: 10000.0,
+            ..default()
+        }),
+        Transform::from_xyz(0.0, 1500.0, 0.1).looking_at(Vec3::ZERO, -Vec3::Z),
     ));
 
     commands.spawn((
@@ -140,17 +307,910 @@ fn setup(
     ));
 
     commands.spawn((
-        Mesh3d(meshes.add(Plane3d::default().mesh().size(300.0, 300.0))),
+        Mesh3d(meshes.add(Plane3d::default().mesh().size(WORLD_SIZE, WORLD_SIZE))),
         MeshMaterial3d(materials.add(StandardMaterial {
-            base_color: Color::srgb(0.15, 0.45, 0.15),
+            base_color: Color::srgb(0.15, 0.35, 0.55),
             ..default()
         })),
         RigidBody::Static,
-        Collider::cuboid(300.0, 0.5, 300.0),
+        Collider::cuboid(WORLD_SIZE, 0.5, WORLD_SIZE),
         Transform::from_xyz(0.0, -0.25, 0.0),
     ));
 
-    spawn_elliptical_fence(&mut commands, &mut meshes, &mut materials);
+}
+
+fn start_osm_fetch(mut commands: Commands, region: Res<SelectedRegion>) {
+    let pool = AsyncComputeTaskPool::get();
+
+    let task = if let Some(path) = parse_osm_file() {
+        pool.spawn(async move { osm::load_osm_file(&path) })
+    } else {
+        let bbox = parse_bbox(&region);
+        pool.spawn(async move { osm::fetch_osm_roads(&bbox) })
+    };
+
+    commands.spawn(OsmFetchTask(task));
+}
+
+fn enter_loading(mut commands: Commands) {
+    commands.spawn((
+        Text::new("Loading OpenStreetMap roads..."),
+        TextColor(Color::srgb(1.0, 1.0, 1.0)),
+        TextFont {
+            font_size: FontSize::Px(24.0),
+            ..default()
+        },
+        Node {
+            position_type: PositionType::Absolute,
+            top: Val::Px(20.0),
+            left: Val::Px(20.0),
+            ..default()
+        },
+        LoadingText,
+    ));
+}
+
+fn enter_world_map(mut commands: Commands) {
+    let pool = AsyncComputeTaskPool::get();
+    let land_task = pool.spawn(async move { fetch_natural_earth_land() });
+    let urban_task = pool.spawn(async move { fetch_urban_areas() });
+    commands.spawn(WorldMapFetchTask(land_task));
+    commands.spawn(UrbanFetchTask(urban_task));
+
+    commands.spawn((
+        Text::new("Loading world map..."),
+        TextColor(Color::srgb(1.0, 1.0, 1.0)),
+        TextFont {
+            font_size: FontSize::Px(24.0),
+            ..default()
+        },
+        Node {
+            position_type: PositionType::Absolute,
+            top: Val::Px(20.0),
+            left: Val::Px(20.0),
+            ..default()
+        },
+        WorldMapText,
+    ));
+}
+
+fn exit_world_map(
+    mut commands: Commands,
+    continents: Query<Entity, With<ContinentVisual>>,
+    ui: Query<Entity, With<WorldMapText>>,
+) {
+    for entity in continents.iter().chain(ui.iter()) {
+        commands.entity(entity).despawn();
+    }
+}
+
+fn check_world_map_fetch(
+    mut commands: Commands,
+    mut tasks: Query<(Entity, &mut WorldMapFetchTask)>,
+    mut meshes: ResMut<Assets<Mesh>>,
+    mut materials: ResMut<Assets<StandardMaterial>>,
+    mut camera: Query<&mut Transform, With<Camera3d>>,
+    ui: Query<Entity, With<WorldMapText>>,
+    mut continents_res: ResMut<WorldContinents>,
+) {
+    for (entity, mut task) in tasks.iter_mut() {
+        if let Some(result) = block_on(poll_once(&mut task.0)) {
+            commands.entity(entity).despawn();
+
+            let material = materials.add(StandardMaterial {
+                base_color: Color::srgb(0.75, 0.65, 0.45),
+                emissive: Color::srgb(0.4, 0.35, 0.25).into(),
+                perceptual_roughness: 0.9,
+                double_sided: true,
+                unlit: true,
+                ..default()
+            });
+
+            let help_text = match &result {
+                Ok(polygons) => {
+                    continents_res.0 = polygons.clone();
+                    let mut min = Vec3::splat(f32::INFINITY);
+                    let mut max = Vec3::splat(f32::NEG_INFINITY);
+                    let mut rendered = 0;
+                    for polygon in polygons {
+                        if polygon.points.len() < 3 {
+                            continue;
+                        }
+                        for &p in &polygon.points {
+                            min = min.min(p);
+                            max = max.max(p);
+                        }
+                        commands.spawn((
+                            Mesh3d(meshes.add(build_continent_mesh(polygon))),
+                            MeshMaterial3d(material.clone()),
+                            Transform::default(),
+                            ContinentVisual,
+                        ));
+                        rendered += 1;
+                    }
+                    eprintln!(
+                        "Rendered {} continent polygons; bounds: min={:?} max={:?}",
+                        rendered, min, max
+                    );
+                    format!(
+                        "World Map\n\
+                        Continents: {}\n\
+                        Click anywhere to select a region\n\
+                        Scroll: zoom in/out",
+                        rendered
+                    )
+                }
+                Err(e) => {
+                    eprintln!("{e}");
+                    format!(
+                        "World Map\n\
+                        Failed to load continents.\n\
+                        {e}\n\
+                        Download ne_110m_land.geojson manually or check network."
+                    )
+                }
+            };
+
+            for loading in ui.iter() {
+                commands.entity(loading).despawn();
+            }
+
+            commands.spawn((
+                Text::new(help_text),
+                TextColor(Color::srgb(1.0, 1.0, 1.0)),
+                TextFont {
+                    font_size: FontSize::Px(18.0),
+                    ..default()
+                },
+                Node {
+                    position_type: PositionType::Absolute,
+                    top: Val::Px(20.0),
+                    left: Val::Px(20.0),
+                    ..default()
+                },
+                WorldMapText,
+            ));
+
+            if let Ok(mut transform) = camera.single_mut() {
+                *transform = Transform::from_xyz(0.0, 1500.0, 0.1)
+                    .looking_at(Vec3::ZERO, -Vec3::Z);
+            }
+        }
+    }
+}
+
+fn check_urban_fetch(
+    mut commands: Commands,
+    mut tasks: Query<(Entity, &mut UrbanFetchTask)>,
+    mut urban_areas: ResMut<WorldUrbanAreas>,
+) {
+    for (entity, mut task) in tasks.iter_mut() {
+        if let Some(result) = block_on(poll_once(&mut task.0)) {
+            commands.entity(entity).despawn();
+            match result {
+                Ok(polygons) => {
+                    eprintln!("Loaded {} urban area polygons", polygons.len());
+                    urban_areas.0 = polygons;
+                }
+                Err(e) => {
+                    eprintln!("Urban areas load failed: {e}");
+                }
+            }
+        }
+    }
+}
+
+fn draw_map_outlines(
+    continents: Res<WorldContinents>,
+    urban_areas: Res<WorldUrbanAreas>,
+    camera: Query<&Transform, With<Camera3d>>,
+    mut gizmos: Gizmos,
+) {
+    let continent_color = Color::srgb(0.9, 0.8, 0.2);
+    for polygon in &continents.0 {
+        for window in polygon.points.windows(2) {
+            gizmos.line(window[0] + Vec3::Y * 1.0, window[1] + Vec3::Y * 1.0, continent_color);
+        }
+        if let (Some(first), Some(last)) = (polygon.points.first(), polygon.points.last()) {
+            gizmos.line(*last + Vec3::Y * 1.0, *first + Vec3::Y * 1.0, continent_color);
+        }
+    }
+
+    const URBAN_ZOOM_HEIGHT: f32 = 1500.0;
+    let Ok(transform) = camera.single() else {
+        return;
+    };
+    if transform.translation.y > URBAN_ZOOM_HEIGHT {
+        return;
+    }
+
+    static mut URBAN_DIAGNOSTICS_SHOWN: bool = false;
+    if !urban_areas.0.is_empty() && !unsafe { URBAN_DIAGNOSTICS_SHOWN } {
+        unsafe { URBAN_DIAGNOSTICS_SHOWN = true };
+        let mut min = Vec3::splat(f32::INFINITY);
+        let mut max = Vec3::splat(f32::NEG_INFINITY);
+        for polygon in &urban_areas.0 {
+            for &p in &polygon.points {
+                min = min.min(p);
+                max = max.max(p);
+            }
+        }
+        eprintln!(
+            "Drawing {} urban areas at camera height {}; bounds: min={:?} max={:?}",
+            urban_areas.0.len(),
+            transform.translation.y,
+            min,
+            max
+        );
+    }
+
+    let urban_color = Color::srgb(0.95, 0.95, 1.0);
+    let marker_color = Color::srgb(1.0, 0.1, 0.1);
+    let marker_radius = (5.0 + (1500.0 - transform.translation.y) * 0.02).max(5.0);
+    let circle_rotation = Quat::from_rotation_x(std::f32::consts::FRAC_PI_2);
+
+    for polygon in &urban_areas.0 {
+        for window in polygon.points.windows(2) {
+            gizmos.line(window[0] + Vec3::Y * 5.0, window[1] + Vec3::Y * 5.0, urban_color);
+        }
+        if let (Some(first), Some(last)) = (polygon.points.first(), polygon.points.last()) {
+            gizmos.line(*last + Vec3::Y * 5.0, *first + Vec3::Y * 5.0, urban_color);
+        }
+
+        let center = polygon_centroid(polygon);
+        gizmos.circle(
+            Isometry3d::new(center + Vec3::Y * 5.0, circle_rotation),
+            marker_radius,
+            marker_color,
+        );
+    }
+}
+
+fn polygon_centroid(polygon: &ContinentPolygon) -> Vec3 {
+    let mut sum = Vec3::ZERO;
+    for &p in &polygon.points {
+        sum += p;
+    }
+    sum / polygon.points.len().max(1) as f32
+}
+
+fn build_continent_mesh(polygon: &ContinentPolygon) -> Mesh {
+    let n = polygon.points.len();
+    let flat: Vec<f64> = polygon
+        .points
+        .iter()
+        .flat_map(|p| [p.x as f64, p.z as f64])
+        .collect();
+    let tri_indices = earcutr::earcut(&flat, &[], 2).unwrap_or_default();
+
+    let mut vertices: Vec<[f32; 3]> = Vec::with_capacity(n);
+    let mut normals: Vec<[f32; 3]> = Vec::with_capacity(n);
+    let mut uvs: Vec<[f32; 2]> = Vec::with_capacity(n);
+
+    for p in &polygon.points {
+        vertices.push([p.x, 0.5, p.z]);
+        normals.push([0.0, 1.0, 0.0]);
+        uvs.push([0.0, 0.0]);
+    }
+
+    // Duplicate every triangle with reversed winding so both faces render
+    // regardless of material double-sided settings.
+    let triangle_count = tri_indices.len() / 3;
+    let mut indices = Vec::with_capacity(tri_indices.len() * 2);
+    for tri in tri_indices.chunks(3) {
+        let a = tri[0] as u32;
+        let b = tri[1] as u32;
+        let c = tri[2] as u32;
+        indices.push(a);
+        indices.push(b);
+        indices.push(c);
+        indices.push(a);
+        indices.push(c);
+        indices.push(b);
+    }
+
+    eprintln!(
+        "continent mesh: {} points, {} earcut triangles -> {} total triangles",
+        n,
+        triangle_count,
+        indices.len() / 3
+    );
+
+    Mesh::new(
+        bevy::render::mesh::PrimitiveTopology::TriangleList,
+        RenderAssetUsages::default(),
+    )
+    .with_inserted_attribute(Mesh::ATTRIBUTE_POSITION, vertices)
+    .with_inserted_attribute(Mesh::ATTRIBUTE_NORMAL, normals)
+    .with_inserted_attribute(Mesh::ATTRIBUTE_UV_0, uvs)
+    .with_inserted_indices(bevy::render::mesh::Indices::U32(indices))
+}
+
+#[cfg(test)]
+mod main_tests {
+    use super::*;
+
+    #[test]
+    fn continent_mesh_has_triangles() {
+        let polygon = ContinentPolygon {
+            points: vec![
+                Vec3::new(0.0, 0.0, 0.0),
+                Vec3::new(100.0, 0.0, 0.0),
+                Vec3::new(100.0, 0.0, 50.0),
+                Vec3::new(0.0, 0.0, 50.0),
+            ],
+        };
+        let mesh = build_continent_mesh(&polygon);
+        let indices = mesh.indices().expect("mesh should have indices");
+        assert!(
+            indices.len() >= 6,
+            "expected at least two triangles for a continent rectangle"
+        );
+    }
+}
+
+fn world_map_zoom(
+    mut scroll_events: MessageReader<MouseWheel>,
+    mut camera: Query<&mut Transform, With<Camera3d>>,
+) {
+    let Ok(mut transform) = camera.single_mut() else {
+        return;
+    };
+
+    const ZOOM_SPEED: f32 = 8.0;
+    const MIN_HEIGHT: f32 = 50.0;
+    const MAX_HEIGHT: f32 = 1500.0;
+
+    for event in scroll_events.read() {
+        let delta = match event.unit {
+            MouseScrollUnit::Line => event.y,
+            MouseScrollUnit::Pixel => event.y * 0.01,
+        };
+        transform.translation.y -= delta * ZOOM_SPEED;
+        transform.translation.y = transform.translation.y.clamp(MIN_HEIGHT, MAX_HEIGHT);
+    }
+}
+
+fn world_map_drag(
+    mut drag_state: ResMut<WorldMapDragState>,
+    mouse: Res<ButtonInput<MouseButton>>,
+    windows: Query<&Window>,
+    camera: Query<(&Camera, &GlobalTransform), With<Camera3d>>,
+    mut camera_local: Query<&mut Transform, With<Camera3d>>,
+) {
+    let Ok(window) = windows.single() else {
+        drag_state.last_cursor = None;
+        return;
+    };
+    let Some(cursor) = window.cursor_position() else {
+        drag_state.last_cursor = None;
+        return;
+    };
+
+    if mouse.just_released(MouseButton::Left) || !mouse.pressed(MouseButton::Left) {
+        drag_state.last_cursor = None;
+        return;
+    }
+
+    let Ok((camera, camera_global)) = camera.single() else {
+        return;
+    };
+    let Ok(mut transform) = camera_local.single_mut() else {
+        return;
+    };
+
+    if let Some(last) = drag_state.last_cursor {
+        let ray_current = camera.viewport_to_world(camera_global, cursor).ok();
+        let ray_last = camera.viewport_to_world(camera_global, last).ok();
+        if let (Some(rc), Some(rl)) = (ray_current, ray_last) {
+            let t_current = -rc.origin.y / rc.direction.y;
+            let t_last = -rl.origin.y / rl.direction.y;
+            if t_current.is_finite() && t_last.is_finite() && t_current > 0.0 && t_last > 0.0 {
+                let current_hit = rc.origin + rc.direction * t_current;
+                let last_hit = rl.origin + rl.direction * t_last;
+                let delta = current_hit - last_hit;
+                transform.translation.x -= delta.x;
+                transform.translation.z -= delta.z;
+            }
+        }
+    }
+
+    drag_state.last_cursor = Some(cursor);
+}
+
+fn check_osm_fetch(
+    mut commands: Commands,
+    mut tasks: Query<(Entity, &mut OsmFetchTask)>,
+    mut next_state: ResMut<NextState<AppState>>,
+    loading_query: Query<Entity, With<LoadingText>>,
+) {
+    for (entity, mut task) in tasks.iter_mut() {
+        if let Some(result) = block_on(poll_once(&mut task.0)) {
+            commands.entity(entity).despawn();
+
+            let mut data = result.unwrap_or_else(|e| {
+                eprintln!("OSM load failed: {e}");
+                OsmData {
+                    roads: Vec::new(),
+                    buildings: Vec::new(),
+                }
+            });
+
+            // Scale OSM meter coordinates down to fit the play area.
+            for segment in &mut data.roads {
+                for point in &mut segment.points {
+                    point.x *= OSM_SCALE;
+                    point.z *= OSM_SCALE;
+                }
+            }
+            for building in &mut data.buildings {
+                for point in &mut building.footprint {
+                    point.x *= OSM_SCALE;
+                    point.z *= OSM_SCALE;
+                }
+                building.height *= OSM_SCALE;
+            }
+
+            eprintln!("Loaded {} roads and {} buildings", data.roads.len(), data.buildings.len());
+            commands.insert_resource(OsmRoads(data.roads));
+            commands.insert_resource(OsmBuildings(data.buildings));
+
+            if let Ok(loading) = loading_query.single() {
+                commands.entity(loading).despawn();
+            }
+
+            next_state.set(AppState::MapSelect);
+        }
+    }
+}
+
+fn enter_map_select(
+    mut commands: Commands,
+    mut meshes: ResMut<Assets<Mesh>>,
+    mut materials: ResMut<Assets<StandardMaterial>>,
+    roads: Res<OsmRoads>,
+    buildings: Res<OsmBuildings>,
+    route: Res<Route>,
+    mut camera: Query<&mut Transform, With<Camera3d>>,
+) {
+    let has_roads = !roads.0.is_empty();
+
+    if has_roads {
+        let road_material = materials.add(StandardMaterial {
+            base_color: Color::srgb(0.6, 0.6, 0.65),
+            ..default()
+        });
+        let road_mesh_base = meshes.add(Cuboid::new(1.0, 0.15, 1.0).mesh());
+
+        for segment in &roads.0 {
+            for window in segment.points.windows(2) {
+                let a = window[0];
+                let b = window[1];
+                let delta = b - a;
+                let length = delta.length();
+                if length < 0.01 {
+                    continue;
+                }
+                let mid = (a + b) * 0.5;
+                let angle = delta.z.atan2(delta.x);
+                let width = 2.0;
+
+                commands.spawn((
+                    Mesh3d(road_mesh_base.clone()),
+                    MeshMaterial3d(road_material.clone()),
+                    Transform {
+                        translation: mid + Vec3::Y * 0.075,
+                        rotation: Quat::from_rotation_y(-angle),
+                        scale: Vec3::new(length, 1.0, width),
+                    },
+                    RoadSegmentVisual,
+                ));
+            }
+        }
+    }
+
+    let building_material = materials.add(StandardMaterial {
+        base_color: Color::srgb(0.35, 0.35, 0.38),
+        perceptual_roughness: 0.9,
+        double_sided: true,
+        ..default()
+    });
+
+    for building in &buildings.0 {
+        if building.footprint.len() < 3 {
+            continue;
+        }
+
+        commands.spawn((
+            Mesh3d(meshes.add(build_building_mesh(building))),
+            MeshMaterial3d(building_material.clone()),
+            Transform::default(),
+            BuildingVisual,
+        ));
+    }
+
+    spawn_route_markers(&mut commands, &mut meshes, &mut materials, &route.0);
+    spawn_route_lines(&mut commands, &mut meshes, &mut materials, &route.0);
+
+    frame_camera_on_data(&roads, &buildings, &mut camera);
+
+    let road_count = roads.0.len();
+    let building_count = buildings.0.len();
+
+    let help_text = if has_roads {
+        format!(
+            "Map Editor\n\
+            Roads: {road_count}  Buildings: {building_count}\n\
+            Click a road to add a marker\n\
+            Scroll: zoom in/out  Home: reset view\n\
+            Backspace: remove last marker\n\
+            C: clear all markers\n\
+            Enter: drive the track\n\
+            M: back to world map\n\
+            A track must be created from OSM roads before driving"
+        )
+    } else {
+        "No OSM roads loaded.\n\
+        Check your network, or run with:\n\
+        --osm-file path/to/map.osm\n\
+        or --bbox \"min_lat,min_lon,max_lat,max_lon\"".to_string()
+    };
+
+    commands.spawn((
+        Text::new(help_text),
+        TextColor(Color::srgb(1.0, 1.0, 1.0)),
+        TextFont {
+            font_size: FontSize::Px(18.0),
+            ..default()
+        },
+        Node {
+            position_type: PositionType::Absolute,
+            top: Val::Px(20.0),
+            left: Val::Px(20.0),
+            ..default()
+        },
+        LoadingText,
+    ));
+}
+
+fn exit_map_select(
+    mut commands: Commands,
+    roads: Query<Entity, With<RoadSegmentVisual>>,
+    buildings: Query<Entity, With<BuildingVisual>>,
+    markers: Query<Entity, With<RouteMarker>>,
+    lines: Query<Entity, With<RouteLine>>,
+    ui: Query<Entity, With<LoadingText>>,
+) {
+    for entity in roads
+        .iter()
+        .chain(buildings.iter())
+        .chain(markers.iter())
+        .chain(lines.iter())
+        .chain(ui.iter())
+    {
+        commands.entity(entity).despawn();
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn map_select_input(
+    mut commands: Commands,
+    mut meshes: ResMut<Assets<Mesh>>,
+    mut materials: ResMut<Assets<StandardMaterial>>,
+    mouse: Res<ButtonInput<MouseButton>>,
+    keyboard: Res<ButtonInput<KeyCode>>,
+    windows: Query<&Window>,
+    camera: Query<(&Camera, &GlobalTransform), With<Camera3d>>,
+    mut camera_transform: Query<&mut Transform, With<Camera3d>>,
+    roads: Res<OsmRoads>,
+    buildings: Res<OsmBuildings>,
+    mut route: ResMut<Route>,
+    markers: Query<Entity, With<RouteMarker>>,
+    lines: Query<Entity, With<RouteLine>>,
+    mut next_state: ResMut<NextState<AppState>>,
+) {
+    if keyboard.just_pressed(KeyCode::Enter) || keyboard.just_pressed(KeyCode::NumpadEnter) {
+        let track = Track::new(route.0.clone());
+        if track.is_valid() {
+            let _ = save_track(&track, TRACK_FILE);
+            next_state.set(AppState::Drive);
+        }
+        return;
+    }
+
+    if keyboard.just_pressed(KeyCode::Home) {
+        frame_camera_on_data(&roads, &buildings, &mut camera_transform);
+        return;
+    }
+
+    if keyboard.just_pressed(KeyCode::KeyM) {
+        next_state.set(AppState::WorldMap);
+        return;
+    }
+
+    if keyboard.just_pressed(KeyCode::Backspace) {
+        route.0.pop();
+        refresh_route_visuals(
+            &mut commands,
+            &mut meshes,
+            &mut materials,
+            &route.0,
+            &markers,
+            &lines,
+        );
+        return;
+    }
+
+    if keyboard.just_pressed(KeyCode::KeyC) {
+        route.0.clear();
+        refresh_route_visuals(
+            &mut commands,
+            &mut meshes,
+            &mut materials,
+            &route.0,
+            &markers,
+            &lines,
+        );
+        return;
+    }
+
+    if !mouse.just_pressed(MouseButton::Left) {
+        return;
+    }
+
+    let Ok(window) = windows.single() else {
+        return;
+    };
+    let Some(cursor) = window.cursor_position() else {
+        return;
+    };
+    let Ok((camera, camera_transform)) = camera.single() else {
+        return;
+    };
+
+    let Ok(ray) = camera.viewport_to_world(camera_transform, cursor) else {
+        return;
+    };
+
+    let t = -ray.origin.y / ray.direction.y;
+    if t < 0.0 || !t.is_finite() {
+        return;
+    }
+    let hit = ray.origin + ray.direction * t;
+
+    let snap = if roads.0.is_empty() {
+        hit
+    } else {
+        osm::nearest_point_on_segments(&roads.0, hit)
+    };
+
+    route.0.push(snap);
+    refresh_route_visuals(
+        &mut commands,
+        &mut meshes,
+        &mut materials,
+        &route.0,
+        &markers,
+        &lines,
+    );
+}
+
+fn refresh_route_visuals(
+    commands: &mut Commands,
+    meshes: &mut ResMut<Assets<Mesh>>,
+    materials: &mut ResMut<Assets<StandardMaterial>>,
+    points: &[Vec3],
+    markers: &Query<Entity, With<RouteMarker>>,
+    lines: &Query<Entity, With<RouteLine>>,
+) {
+    for entity in markers.iter().chain(lines.iter()) {
+        commands.entity(entity).despawn();
+    }
+    spawn_route_markers(commands, meshes, materials, points);
+    spawn_route_lines(commands, meshes, materials, points);
+}
+
+fn spawn_route_markers(
+    commands: &mut Commands,
+    meshes: &mut ResMut<Assets<Mesh>>,
+    materials: &mut ResMut<Assets<StandardMaterial>>,
+    points: &[Vec3],
+) {
+    let marker_material = materials.add(StandardMaterial {
+        base_color: Color::srgb(1.0, 0.8, 0.0),
+        ..default()
+    });
+    let marker_mesh = meshes.add(Sphere::new(0.3).mesh().ico(8).unwrap());
+
+    for &point in points {
+        commands.spawn((
+            Mesh3d(marker_mesh.clone()),
+            MeshMaterial3d(marker_material.clone()),
+            Transform::from_translation(point + Vec3::Y * 0.3),
+            RouteMarker,
+        ));
+    }
+}
+
+fn spawn_route_lines(
+    commands: &mut Commands,
+    meshes: &mut ResMut<Assets<Mesh>>,
+    materials: &mut ResMut<Assets<StandardMaterial>>,
+    points: &[Vec3],
+) {
+    if points.len() < 2 {
+        return;
+    }
+
+    let line_material = materials.add(StandardMaterial {
+        base_color: Color::srgb(0.9, 0.7, 0.0),
+        ..default()
+    });
+    let line_mesh_base = meshes.add(Cuboid::new(1.0, 0.05, 1.0).mesh());
+
+    for window in points.windows(2) {
+        let a = window[0];
+        let b = window[1];
+        let delta = b - a;
+        let length = delta.length();
+        if length < 0.01 {
+            continue;
+        }
+        let mid = (a + b) * 0.5;
+        let angle = delta.z.atan2(delta.x);
+
+        commands.spawn((
+            Mesh3d(line_mesh_base.clone()),
+            MeshMaterial3d(line_material.clone()),
+            Transform {
+                translation: mid + Vec3::Y * 0.1,
+                rotation: Quat::from_rotation_y(-angle),
+                scale: Vec3::new(length, 1.0, 0.2),
+            },
+            RouteLine,
+        ));
+    }
+}
+
+fn frame_camera_on_data(
+    roads: &OsmRoads,
+    buildings: &OsmBuildings,
+    camera: &mut Query<&mut Transform, With<Camera3d>>,
+) {
+    let mut min = Vec3::splat(f32::INFINITY);
+    let mut max = Vec3::splat(f32::NEG_INFINITY);
+    let mut has_points = false;
+
+    for segment in &roads.0 {
+        for &point in &segment.points {
+            min = min.min(point);
+            max = max.max(point);
+            has_points = true;
+        }
+    }
+    for building in &buildings.0 {
+        for &point in &building.footprint {
+            min = min.min(point);
+            max = max.max(point);
+            has_points = true;
+        }
+    }
+
+    if has_points {
+        let center = (min + max) * 0.5;
+        let size = (max - min).max_element();
+        let height = (size * 1.5 + 50.0).min(1500.0);
+
+        if let Ok(mut transform) = camera.single_mut() {
+            *transform = Transform::from_xyz(center.x, height, center.z + 0.1)
+                .looking_at(center, -Vec3::Z);
+        }
+    }
+}
+
+fn update_camera_overview(
+    roads: Res<OsmRoads>,
+    buildings: Res<OsmBuildings>,
+    mut camera: Query<&mut Transform, With<Camera3d>>,
+) {
+    if roads.is_changed() || buildings.is_changed() {
+        frame_camera_on_data(&roads, &buildings, &mut camera);
+    }
+}
+
+fn map_select_zoom(
+    mut scroll_events: MessageReader<MouseWheel>,
+    mut camera: Query<&mut Transform, With<Camera3d>>,
+) {
+    let Ok(mut transform) = camera.single_mut() else {
+        return;
+    };
+
+    const ZOOM_SPEED: f32 = 8.0;
+    const MIN_HEIGHT: f32 = 10.0;
+    const MAX_HEIGHT: f32 = 1500.0;
+
+    for event in scroll_events.read() {
+        let delta = match event.unit {
+            MouseScrollUnit::Line => event.y,
+            MouseScrollUnit::Pixel => event.y * 0.01,
+        };
+        transform.translation.y -= delta * ZOOM_SPEED;
+        transform.translation.y = transform.translation.y.clamp(MIN_HEIGHT, MAX_HEIGHT);
+    }
+}
+
+fn enter_drive(
+    mut commands: Commands,
+    mut meshes: ResMut<Assets<Mesh>>,
+    mut materials: ResMut<Assets<StandardMaterial>>,
+    route: Res<Route>,
+    buildings: Res<OsmBuildings>,
+) {
+    let track = Track::new(route.0.clone());
+    if !track.is_valid() {
+        eprintln!("Cannot drive: no valid track. Mark at least 3 road points.");
+        return;
+    }
+
+    let road_material = materials.add(StandardMaterial {
+        base_color: Color::srgb(0.25, 0.25, 0.25),
+        ..default()
+    });
+
+    commands.spawn((
+        Mesh3d(meshes.add(build_track_mesh(&track))),
+        MeshMaterial3d(road_material),
+        RigidBody::Static,
+        Collider::trimesh_from_mesh(&build_track_mesh(&track)).unwrap_or(Collider::cuboid(1.0, 0.1, 1.0)),
+        Transform::default(),
+        TrackRoad,
+    ));
+
+    let fence_material = materials.add(StandardMaterial {
+        base_color: Color::srgb(0.85, 0.85, 0.85),
+        ..default()
+    });
+    let fence_mesh = meshes.add(Cuboid::new(1.0, 1.0, 1.0).mesh());
+
+    let segments = track.control_points.len().max(3) * 10;
+    let (left_fences, right_fences) = build_fences(&track, segments);
+    for fence in left_fences.into_iter().chain(right_fences) {
+        commands.spawn((
+            Mesh3d(fence_mesh.clone()),
+            MeshMaterial3d(fence_material.clone()),
+            fence.transform,
+            RigidBody::Static,
+            Collider::cuboid(fence.size.x, fence.size.y, fence.size.z),
+            Friction::new(0.9),
+            TrackFence,
+        ));
+    }
+
+    let building_material = materials.add(StandardMaterial {
+        base_color: Color::srgb(0.35, 0.35, 0.38),
+        perceptual_roughness: 0.9,
+        double_sided: true,
+        ..default()
+    });
+
+    for building in &buildings.0 {
+        if building.footprint.len() < 3 {
+            continue;
+        }
+
+        commands.spawn((
+            Mesh3d(meshes.add(build_building_mesh(building))),
+            MeshMaterial3d(building_material.clone()),
+            Transform::default(),
+            BuildingVisual,
+        ));
+    }
+
+    let start_pos = track.control_points.first().copied().unwrap_or(Vec3::ZERO);
+    let next_pos = track.control_points.get(1).copied().unwrap_or(start_pos + Vec3::X);
+    let forward = (next_pos - start_pos).normalize_or(Vec3::X);
+    let rotation = Quat::from_rotation_arc(Vec3::Z, forward);
 
     commands.spawn((
         Mesh3d(meshes.add(Cuboid::new(1.0, 1.0, 1.0).mesh())),
@@ -158,7 +1218,7 @@ fn setup(
             base_color: Color::srgb(0.85, 0.1, 0.1),
             ..default()
         })),
-        Transform::from_xyz(30.0, 0.75, 0.0),
+        Transform::from_translation(start_pos + Vec3::Y * 0.75).with_rotation(rotation),
         Vehicle,
         VehicleController::default(),
         RigidBody::Dynamic,
@@ -173,59 +1233,52 @@ fn setup(
             .lock_rotation_x()
             .lock_rotation_z(),
     ));
+
+    commands.spawn((
+        Text::new("Drive mode\nWASD / Arrows: drive\nR: return to editor\nM: world map"),
+        TextColor(Color::srgb(1.0, 1.0, 1.0)),
+        TextFont {
+            font_size: FontSize::Px(18.0),
+            ..default()
+        },
+        Node {
+            position_type: PositionType::Absolute,
+            top: Val::Px(20.0),
+            left: Val::Px(20.0),
+            ..default()
+        },
+        LoadingText,
+    ));
 }
 
-fn spawn_elliptical_fence(
-    commands: &mut Commands,
-    meshes: &mut ResMut<Assets<Mesh>>,
-    materials: &mut ResMut<Assets<StandardMaterial>>,
+fn exit_drive(
+    mut commands: Commands,
+    roads: Query<Entity, With<TrackRoad>>,
+    fences: Query<Entity, With<TrackFence>>,
+    buildings: Query<Entity, With<BuildingVisual>>,
+    vehicles: Query<Entity, With<Vehicle>>,
+    ui: Query<Entity, With<LoadingText>>,
 ) {
-    let a = 30.0;
-    let b = 20.0;
-    let track_width = 7.0;
-    let fence_height = 1.0;
-    let fence_thickness = 0.5;
-    let segments = 64;
+    for entity in roads
+        .iter()
+        .chain(fences.iter())
+        .chain(buildings.iter())
+        .chain(vehicles.iter())
+        .chain(ui.iter())
+    {
+        commands.entity(entity).despawn();
+    }
+}
 
-    let fence_material = materials.add(StandardMaterial {
-        base_color: Color::srgb(0.85, 0.85, 0.85),
-        ..default()
-    });
-    let fence_mesh = meshes.add(Cuboid::new(1.0, 1.0, 1.0).mesh());
-
-    let a_outer = a + track_width * 0.5;
-    let b_outer = b + track_width * 0.5;
-    let a_inner = a - track_width * 0.5;
-    let b_inner = b - track_width * 0.5;
-
-    for (a_ring, b_ring) in [(a_outer, b_outer), (a_inner, b_inner)] {
-        for i in 0..segments {
-            let t0 = TAU * i as f32 / segments as f32;
-            let t1 = TAU * (i + 1) as f32 / segments as f32;
-            let t = (t0 + t1) * 0.5;
-
-            let x = a_ring * t.cos();
-            let z = b_ring * t.sin();
-            let dx = -a_ring * t.sin();
-            let dz = b_ring * t.cos();
-            let angle = dx.atan2(dz);
-
-            let arc = ((dx * dx + dz * dz).sqrt()) * (t1 - t0);
-            let depth = arc + 0.15;
-
-            commands.spawn((
-                Mesh3d(fence_mesh.clone()),
-                MeshMaterial3d(fence_material.clone()),
-                Transform {
-                    translation: Vec3::new(x, fence_height * 0.5, z),
-                    rotation: Quat::from_rotation_y(angle),
-                    scale: Vec3::new(fence_thickness, fence_height, depth),
-                },
-                RigidBody::Static,
-                Collider::cuboid(fence_thickness, fence_height, depth),
-                Friction::new(0.9),
-            ));
-        }
+fn drive_input(
+    keyboard: Res<ButtonInput<KeyCode>>,
+    mut next_state: ResMut<NextState<AppState>>,
+) {
+    if keyboard.just_pressed(KeyCode::KeyR) {
+        next_state.set(AppState::MapSelect);
+    }
+    if keyboard.just_pressed(KeyCode::KeyM) {
+        next_state.set(AppState::WorldMap);
     }
 }
 
@@ -248,7 +1301,6 @@ fn vehicle_controls(
     let left = keyboard.pressed(KeyCode::KeyA) || keyboard.pressed(KeyCode::ArrowLeft);
     let right = keyboard.pressed(KeyCode::KeyD) || keyboard.pressed(KeyCode::ArrowRight);
 
-    // Throttle builds up and down with inertia.
     if accelerating {
         controller.throttle += THROTTLE_RATE * dt;
     } else if braking {
@@ -262,7 +1314,6 @@ fn vehicle_controls(
     }
     controller.throttle = controller.throttle.clamp(MAX_REVERSE_SPEED, MAX_SPEED);
 
-    // Steering input builds up and returns to center with inertia.
     let steer_input = (right as i32 - left as i32) as f32;
     if steer_input != 0.0 {
         controller.steering += steer_input * STEER_RATE * dt;
@@ -275,19 +1326,12 @@ fn vehicle_controls(
     }
     controller.steering = controller.steering.clamp(-1.0, 1.0);
 
-    // Apply engine/brake force to reach the target speed.
     let speed_error = controller.throttle - speed;
     forces.apply_force(forward * speed_error * SPEED_CONTROL_GAIN * mass.0);
 
-    // Lateral grip pulls the velocity to follow the vehicle's heading,
-    // so steering actually changes the direction of travel instead of just
-    // spinning the cube.
     let lateral_velocity = forces.linear_velocity() - forward * speed;
     forces.apply_force(-lateral_velocity * LATERAL_GRIP * mass.0);
 
-    // The yaw target is reached through torque, so the rotation has inertia.
-    // The torque direction is flipped when reversing so A/D always map to the
-    // left/right side of the screen as seen from the chase camera.
     let drive_direction = if speed < 0.0 { -1.0 } else { 1.0 };
     let target_yaw_rate = -controller.steering * MAX_YAW_RATE * drive_direction;
     let yaw_error = target_yaw_rate - yaw_rate;
